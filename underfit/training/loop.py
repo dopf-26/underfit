@@ -526,6 +526,7 @@ def run_training(args, backend):
                 traceback.print_exc()
 
         while raw_step < max_steps:
+            batches_this_epoch = 0
             pbar = tqdm(
                 train_dl,
                 desc=f"Step {raw_step + step_offset}, Epoch {epoch}",
@@ -534,6 +535,7 @@ def run_training(args, backend):
                 file=sys.stdout,
             )
             for batch_idx, batch in enumerate(pbar):
+                batches_this_epoch += 1
                 if raw_step >= max_steps:
                     break
                 global_step = raw_step + step_offset
@@ -732,6 +734,16 @@ def run_training(args, backend):
 
                 if raw_step >= max_steps:
                     break
+            if batches_this_epoch == 0:
+                # 0-batch epoch: the dataloader is empty (all samples excluded
+                # or rejected by the metadata fn). Without this the while loop
+                # above would spin forever with raw_step stuck at its current
+                # value — the process stays alive so the dashboard's crash
+                # monitor never fires.
+                raise RuntimeError(
+                    "Empty training dataset — dataloader yielded 0 batches "
+                    "(all samples excluded or rejected by the metadata fn)."
+                )
             epoch += 1
 
         # Final save (skip if the last regular save already covered this

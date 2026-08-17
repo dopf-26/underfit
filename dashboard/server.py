@@ -8101,7 +8101,7 @@ if __name__ == "__main__":
                 print(f"Port {PORT} taken — using {bind_port + offset} instead.")
             break
         except OSError as e:
-            if e.errno != 98:  # EADDRINUSE
+            if e.errno not in (98, 10048):  # EADDRINUSE (98 on POSIX, 10048 on Windows)
                 raise
     if server is None:
         raise RuntimeError(f"Could not find a free port in {PORT}..{PORT + 49}")
