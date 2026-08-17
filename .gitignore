@@ -21,6 +21,8 @@ build/
 Thumbs.db
 .vscode/
 .idea/
+.gradio/
+.venv/
 
 # ── Internal-only docs & scripts (not part of the public release) ───────
 _internal/
