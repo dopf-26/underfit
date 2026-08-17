@@ -3248,8 +3248,9 @@ def _extract_hyperparams(run):
                 result["pre_encoded"] = training.get("pre_encoded", False)
                 if training.get("base_precision"):
                     result["base_precision"] = training["base_precision"]
-                if training.get("torch_compile"):
-                    result["torch_compile"] = training["torch_compile"]
+                # Always echo torch_compile too, so checkbox restores reflect
+                # the real stored state (False = off), not just "was it on".
+                result["torch_compile"] = bool(training.get("torch_compile", False))
                 # Always echo use_checkpointing (default True) so the checkbox
                 # restore reflects the real stored state, not just "was it on".
                 result["use_checkpointing"] = training.get("use_checkpointing", True)
@@ -4311,8 +4312,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 cfg["svd_bases_path"] = mi["svd_bases"]
             if base_precision:
                 cfg["training"]["base_precision"] = base_precision
-            if torch_compile:
-                cfg["training"]["torch_compile"] = True
+            # Explicit write (False = off): a template that later ships
+            # torch_compile: true must not silently force compile on.
+            cfg["training"]["torch_compile"] = torch_compile
             if has_use_checkpointing:
                 cfg["training"]["use_checkpointing"] = bool(body["use_checkpointing"])
             # Timestep-ratio focus (null/absent = disabled -> template behavior).
@@ -4754,7 +4756,6 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         demo_every = body.get("demo_every")
         lr_raw = body.get("lr", "")
         queue_flag = bool(body.get("queue", False))
-        torch_compile = bool(body.get("torch_compile", False))
         has_use_checkpointing = "use_checkpointing" in body
 
         # Find checkpoint to resume from
@@ -4832,8 +4833,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             import random as _rng
             for entry in cfg.get("training", {}).get("demo", {}).get("demo_cond", []):
                 entry["seed"] = _rng.randint(10, 100)
-            if torch_compile:
-                cfg.setdefault("training", {})["torch_compile"] = True
+            # Honor an explicit value from the frontend (true OR false) so the
+            # checkbox can also switch compile OFF — otherwise the flag sticks
+            # at whatever the previous launch stored. Absent key (old client)
+            # leaves the stored state untouched.
+            if "torch_compile" in body:
+                cfg.setdefault("training", {})["torch_compile"] = bool(body["torch_compile"])
             if has_use_checkpointing:
                 cfg.setdefault("training", {})["use_checkpointing"] = bool(body["use_checkpointing"])
             # Timestep-ratio focus (null/absent = disabled -> template behavior).
@@ -7481,6 +7486,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     result["lora_include"] = ", ".join(lora.get("include", []))
                     result["lora_exclude"] = ", ".join(lora.get("exclude", []))
                     result["base_precision"] = training.get("base_precision", "")
+                    # Toggle states for the clone modal — always echoed so the
+                    # frontend mirrors the source run's real state (False = off).
+                    result["torch_compile"] = bool(training.get("torch_compile", False))
+                    result["use_checkpointing"] = bool(training.get("use_checkpointing", True))
+                    result["timestep_ratio"] = training.get("timestep_sampler_options", {}).get("ratio")
                     result["lr"] = opt.get("config", {}).get("lr")
                     result["demo_every"] = demo.get("demo_every")
                     result["demo_cond"] = demo.get("demo_cond", [])

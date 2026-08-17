@@ -1247,11 +1247,11 @@
        <input type="text" class="resume-input" id="resume-lr" value="" placeholder="default (keep current)" oninput="validateResume()">
         <div style="display:flex;align-items:center;gap:16px;margin-top:8px;flex-wrap:wrap">
           <div style="display:flex;align-items:center;gap:6px">
-            <input type="checkbox" id="resume-torch-compile" style="width:16px;height:16px;cursor:pointer">
+            <input type="checkbox" id="resume-torch-compile" checked style="width:16px;height:16px;cursor:pointer">
             <label for="resume-torch-compile" style="cursor:pointer;font-size:0.9em">Enable torch.compile</label>
           </div>
           <div style="display:flex;align-items:center;gap:6px">
-            <input type="checkbox" id="resume-use-checkpointing" checked title="Trade VRAM for speed. Turning this OFF uses more VRAM and may OOM on long clips / big models." style="width:16px;height:16px;cursor:pointer">
+            <input type="checkbox" id="resume-use-checkpointing" title="Trade VRAM for speed. Turning this OFF uses more VRAM and may OOM on long clips / big models." style="width:16px;height:16px;cursor:pointer">
             <label for="resume-use-checkpointing" style="cursor:pointer;font-size:0.9em">Gradient checkpointing</label>
           </div>
           <div style="display:flex;align-items:center;gap:6px">
@@ -1309,11 +1309,11 @@
          </div>
           <div style="display:flex;align-items:center;gap:16px;margin-top:16px;flex-wrap:wrap">
             <div style="display:flex;align-items:center;gap:6px">
-              <input type="checkbox" id="new-ft-torch-compile" style="width:16px;height:16px;cursor:pointer">
+              <input type="checkbox" id="new-ft-torch-compile" checked style="width:16px;height:16px;cursor:pointer">
               <label for="new-ft-torch-compile" style="cursor:pointer;font-size:0.9em">Enable torch.compile</label>
             </div>
             <div style="display:flex;align-items:center;gap:6px">
-              <input type="checkbox" id="new-ft-use-checkpointing" checked title="Trade VRAM for speed. Turning this OFF uses more VRAM and may OOM on long clips / big models." style="width:16px;height:16px;cursor:pointer">
+              <input type="checkbox" id="new-ft-use-checkpointing" title="Trade VRAM for speed. Turning this OFF uses more VRAM and may OOM on long clips / big models." style="width:16px;height:16px;cursor:pointer">
               <label for="new-ft-use-checkpointing" style="cursor:pointer;font-size:0.9em">Gradient checkpointing</label>
             </div>
             <div style="display:flex;align-items:center;gap:6px">
@@ -4541,6 +4541,9 @@ window.openResumeModal = function() {
   document.getElementById('resume-crop-length').value = hp.latent_crop_length || _resumeSeqInfo.length;
   document.getElementById('resume-crop-mode').value = hp.crop_mode || 'random';
   document.getElementById('resume-use-checkpointing').checked = (_currentStatus.use_checkpointing !== false);
+  // Reflect the run's real torch.compile state (absent/undefined = off) so the
+  // box is an accurate toggle, not just an "enable" switch.
+  document.getElementById('resume-torch-compile').checked = (_currentStatus.torch_compile === true);
   _restoreTimestepRatio('resume', _currentStatus.timestep_ratio);
   _updateResumeCropSeconds();
   document.getElementById('resume-error').textContent = '';
@@ -4714,7 +4717,9 @@ window.confirmResume = async function() {
   if (lrStr) payload.lr = lrStr;
   if (!isNaN(cropLen) && cropLen > 0) payload.latent_crop_length = cropLen;
    payload.random_crop = cropMode === 'random';
-    if (document.getElementById('resume-torch-compile').checked) payload.torch_compile = true;
+    // Always send (true or false) so the server can also switch compile OFF —
+    // the resume config otherwise inherits the flag from the previous launch.
+    payload.torch_compile = document.getElementById('resume-torch-compile').checked;
     payload.use_checkpointing = document.getElementById('resume-use-checkpointing').checked;
     payload.timestep_ratio = _timestepRatioValue('resume');
     try {
@@ -4751,7 +4756,9 @@ window.confirmResumeQueue = async function() {
    if (lrStr) payload.lr = lrStr;
    if (!isNaN(cropLen) && cropLen > 0) payload.latent_crop_length = cropLen;
    payload.random_crop = cropMode === 'random';
-    if (document.getElementById('resume-torch-compile').checked) payload.torch_compile = true;
+    // Always send (true or false) so the server can also switch compile OFF —
+    // the resume config otherwise inherits the flag from the previous launch.
+    payload.torch_compile = document.getElementById('resume-torch-compile').checked;
     payload.use_checkpointing = document.getElementById('resume-use-checkpointing').checked;
     payload.timestep_ratio = _timestepRatioValue('resume');
     try {
@@ -6002,7 +6009,9 @@ window.cloneRunSettings = async function() {
     if (s.max_steps) document.getElementById('new-ft-steps').value = s.max_steps;
     if (s.lr) document.getElementById('new-ft-lr').value = s.lr;
     if (s.base_precision) document.getElementById('new-ft-base-precision').value = s.base_precision;
-    if (s.torch_compile) document.getElementById('new-ft-torch-compile').checked = true;
+    // clone_settings always echoes torch_compile, so mirror the source run's
+    // real state — a clone of a non-compiling run must stay off.
+    document.getElementById('new-ft-torch-compile').checked = !!s.torch_compile;
     document.getElementById('new-ft-use-checkpointing').checked = (s.use_checkpointing !== false);
     _restoreTimestepRatio('new-ft', s.timestep_ratio);
     if (s.checkpoint_every) document.getElementById('new-ft-ckpt-every').value = s.checkpoint_every;
@@ -6121,6 +6130,11 @@ window.openNewFinetuneModal = async function() {
     if (_bmOptions.has(_pref)) { _bmEl.value = _pref; break; }
   }
   document.getElementById('new-ft-base-precision').value = 'fp16';
+  // Reset toggles to their HTML defaults — otherwise a box checked on a
+  // previous open (or auto-checked by cloneRunSettings) leaks into the next
+  // launch and torch.compile stays on "always".
+  document.getElementById('new-ft-torch-compile').checked = true;
+  document.getElementById('new-ft-use-checkpointing').checked = false;
   document.getElementById('new-ft-batch').value = '1';
   document.getElementById('new-ft-steps').value = '40000';
   document.getElementById('new-ft-lora-type').value = 'dora-rows';
