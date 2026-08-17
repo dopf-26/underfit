@@ -102,9 +102,14 @@ def stream_checkpoint_into_model(model, ckpt_path, *, device, dtype=None,
 
 def remove_weight_norm_from_model(model):
     for module in model.modules():
-        if hasattr(module, "weight"):
+        # weight_g exists only while weight_norm is actually applied —
+        # remove_weight_norm() raises on any plain Linear/Conv module.
+        if hasattr(module, "weight") and hasattr(module, "weight_g"):
             print(f"Removing weight norm from {module}")
-            remove_weight_norm(module)
+            try:
+                remove_weight_norm(module)
+            except Exception as e:
+                print(f"  warn: remove_weight_norm on {module.__class__.__name__}: {e}", flush=True)
     return model
 
 

@@ -694,6 +694,28 @@ def _split_restart_cmd(cmd):
     return parsed[0], parsed[1:]
 
 
+# shlex-quoted values containing spaces look like --model-config '/a b/c.json'
+# (single quotes, quotes escaped as '\''); a bare \S+ regex stops at the first
+# space and mangles them. Alternation order matters: quoted forms first.
+_CMD_VALUE = r"(?:'[^']*'|\"[^\"]*\"|\S+)"
+
+
+def _get_cmd_arg(cmd, flag):
+    """Extract the value following `flag` in a shlex-quoted command string.
+
+    Robust to quoted paths with spaces (e.g. --model-config '/a b/c.json');
+    returns None if the flag is absent.
+    """
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        tokens = cmd.split()
+    for i, tok in enumerate(tokens):
+        if tok == flag and i + 1 < len(tokens):
+            return tokens[i + 1]
+    return None
+
+
 def _get_children_pids(pid):
     """Return list of (direct + recursive) child PIDs for a given PID.
 
@@ -789,7 +811,15 @@ def _kill_process_group(pid, paused=False):
 
 
 def _free_gpu_memory(gpu):
-    """Run cuda.empty_cache() on the specified GPU to free VRAM."""
+    """Best-effort VRAM free: run cuda.empty_cache() on the given GPU.
+
+    Honest about what this does (and doesn't) do: the child process opens a
+    *fresh* CUDA context and holds no tensors of its own, so empty_cache()
+    releases that child's (tiny) cache and exits — it does not free VRAM
+    belonging to other processes (the actual training runs). It's a cheap
+    housekeeping nudge, not a hard reclaim; a truly stuck GPU needs its
+    process killed (or an nvidia-smi reset).
+    """
     if gpu is None:
         return
     try:
@@ -988,6 +1018,27 @@ def _read_log_compressed(log_path):
         return "\n".join(_process_log_lines(raw))
     except Exception:
         return ""
+
+
+# rglob count of .npy files per latent dir. Encodes write ~1 file/second, so
+# the count legitimately changes, but the progress UI doesn't need sub-second
+# resolution and the directory can hold tens of thousands of files.
+_encode_count_cache = {}  # str(dir) -> (count, ts)
+_ENCODE_COUNT_TTL = 2.0
+
+
+def _count_npy_cached(latent_dir):
+    """Count *.npy under latent_dir, caching the rglob for ~2s per dir."""
+    now = time.time()
+    key = str(latent_dir)
+    cached = _encode_count_cache.get(key)
+    if cached is not None and now - cached[1] < _ENCODE_COUNT_TTL:
+        return cached[0]
+    count = sum(1 for _ in latent_dir.rglob("*.npy"))
+    if len(_encode_count_cache) > 16:
+        _encode_count_cache.clear()
+    _encode_count_cache[key] = (count, now)
+    return count
 
 
 class RunsRegistry:
@@ -2419,6 +2470,9 @@ class TrainingMonitor:
                     # Ensure gradient clipping is present (older runs may lack it)
                     if "--gradient-clip-val" not in restart_cmd:
                         restart_cmd += "     --gradient-clip-val 1.0"
+                        # Persist so the resume path and any later crash-restart
+                        # start from the same command, not the pre-append copy.
+                        self._registry.update_run(run_id, restart_cmd=restart_cmd)
                     # Restart training and append stdout/stderr to the log file.
                     backend_env = _backend_env_for_model(fresh_run.get("base_model"))
                     demo_dir = fresh_run.get("demo_source_dir", str(RUNS_DIR))
@@ -2592,6 +2646,9 @@ class TrainingMonitor:
             log_f.close()
         except Exception as e:
             print(f"[queue] Failed to launch {run_id}: {e}")
+            # Mark the run so it doesn't sit "queued" forever (the queue drain
+            # only retries "training" slots, never stuck queued ones).
+            self._registry.update_run(run_id, status="error", error=f"Failed to launch: {e}")
             return
 
         self._registry.update_run(run_id,
@@ -2644,6 +2701,7 @@ class TrainingMonitor:
             log_f.close()
         except Exception as e:
             print(f"[queue] Failed to launch queued resume {run_id}: {e}")
+            self._registry.update_run(run_id, status="error", error=f"Failed to launch: {e}")
             return
 
         self._registry.update_run(run_id,
@@ -2986,6 +3044,75 @@ def _query_gpu_compute_caps() -> dict:
 def _get_cuda_to_nvidia() -> dict:
     """Return the cached CUDA→nvidia-smi index mapping."""
     return _cuda_to_nvidia or {}
+
+
+# GPU names in CUDA enumeration order — fetched exactly once, in a short-lived
+# subprocess. The dashboard process must never open a CUDA context itself
+# (torch.cuda.device_count() initializes the driver and can hold VRAM per
+# visible GPU, distorting OOM-margin estimates and colliding with trainers).
+_cuda_gpu_names: list | None = None
+_cuda_gpu_names_lock = threading.Lock()
+
+
+def _get_cuda_gpu_names() -> list:
+    """Return GPU names in CUDA enumeration order (cached, one-shot)."""
+    global _cuda_gpu_names
+    if _cuda_gpu_names is not None:
+        return _cuda_gpu_names
+    with _cuda_gpu_names_lock:
+        if _cuda_gpu_names is not None:
+            return _cuda_gpu_names
+        names: list = []
+        try:
+            out = subprocess.run(
+                [str(VENV_PYTHON), "-c",
+                 "import json, torch\n"
+                 "print(json.dumps([torch.cuda.get_device_properties(i).name "
+                 "for i in range(torch.cuda.device_count())]))"],
+                capture_output=True, text=True, timeout=120,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                names = json.loads(out.stdout.strip().splitlines()[-1])
+        except Exception:
+            names = []
+        _cuda_gpu_names = names
+        return names
+
+
+def _match_gpu_orders(cuda_names, nvidia_order):
+    """Pair CUDA device indices with nvidia-smi indices.
+
+    Greedy one-to-one name matching (exact, then substring); leftover devices
+    pair positionally, which is the right answer for identical hardware where
+    names are ambiguous by definition. Accepts fewer CUDA devices than
+    nvidia-smi entries (CUDA_VISIBLE_DEVICES filtering) — unmatched
+    nvidia-smi entries simply keep their own index.
+    Returns (nvidia_to_cuda, cuda_to_nvidia).
+    """
+    cuda_to_nvidia = {}
+    free = list(range(len(nvidia_order)))
+    for ci, cname in enumerate(cuda_names):
+        cl = str(cname).lower()
+        for ni in list(free):
+            nl = str(nvidia_order[ni][1]).lower()
+            if cl == nl or cl in nl or nl in cl:
+                cuda_to_nvidia[ci] = ni
+                free.remove(ni)
+                break
+    unassigned = [ci for ci in range(len(cuda_names)) if ci not in cuda_to_nvidia]
+    for ci, ni in zip(unassigned, free):
+        cuda_to_nvidia[ci] = ni
+    nvidia_to_cuda = {ni: ci for ci, ni in cuda_to_nvidia.items()}
+    return nvidia_to_cuda, cuda_to_nvidia
+
+
+# GPU info cache — _compute_gpu_info spawns an nvidia-smi subprocess and walks
+# every active run's log tail. With N SSE clients ticking once per second, an
+# unshared computation becomes N subprocess spawns per second. All clients
+# share one computation per TTL window.
+_gpu_info_cache = {"data": None, "ts": 0.0}
+_gpu_info_cache_lock = threading.Lock()
+GPU_INFO_TTL = 2.0
 
 
 # Gradio VRAM estimation
@@ -3713,8 +3840,20 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json_response({"content": "", "mtime": None})
                 return
             try:
+                # Tail the last ~512 KB — gradio logs are unbounded (the
+                # tailer appends forever) and we only render the last `tail`
+                # lines anyway, so the head of the file is never needed.
+                file_size = os.path.getsize(lp)
+                tail_max = 512 * 1024
                 with open(lp, "rb") as f:
-                    raw = f.read()
+                    if file_size > tail_max:
+                        f.seek(file_size - tail_max)
+                        raw = f.read()
+                        nl = raw.find(b"\n")
+                        if nl >= 0:
+                            raw = raw[nl + 1:]
+                    else:
+                        raw = f.read()
                 # Collapse \r (inline tqdm) and consecutive progress-bar lines
                 lines = []
                 for chunk in raw.split(b"\n"):
@@ -3818,7 +3957,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if not ds or not rel:
                 self.send_error(404)
                 return
-            fpath = Path(ds.get("input_dir", "")) / rel
+            input_dir = Path(ds.get("input_dir", ""))
+            fpath = (input_dir / rel).resolve()
+            if not str(fpath).startswith(str(input_dir.resolve())):
+                self.send_error(403)
+                return
             if not fpath.exists() or not fpath.is_file():
                 self.send_error(404)
                 return
@@ -3835,25 +3978,38 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             with open(fpath, "rb") as f:
-                self.wfile.write(f.read())
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
         elif path.startswith("/api/scan-audio/"):
-            # Serve audio preview from an absolute path (for scan modal before dataset exists)
+            # Serve audio preview from an absolute path (for scan modal before dataset exists).
+            # The path is arbitrary by design (the dataset doesn't exist yet), so
+            # restrict to known audio extensions instead of a directory prefix.
             abs_path = unquote(path[len("/api/scan-audio/"):])
+            ext = os.path.splitext(abs_path)[1].lower()
+            ct = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac",
+                  ".ogg": "audio/ogg", ".aif": "audio/aiff", ".aiff": "audio/aiff",
+                  ".m4a": "audio/mp4", ".aac": "audio/aac"}.get(ext)
+            if ct is None:
+                self.send_error(404)
+                return
             fpath = Path(abs_path)
             if not fpath.exists() or not fpath.is_file():
                 self.send_error(404)
                 return
-            ext = fpath.suffix.lower()
-            ct = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac",
-                  ".ogg": "audio/ogg", ".aif": "audio/aiff", ".aiff": "audio/aiff",
-                  ".m4a": "audio/mp4", ".aac": "audio/aac"}.get(ext, "audio/wav")
             self.send_response(200)
             self.send_header("Content-Type", ct)
             self.send_header("Content-Length", str(fpath.stat().st_size))
             self.send_header("Accept-Ranges", "bytes")
             self.end_headers()
             with open(fpath, "rb") as f:
-                self.wfile.write(f.read())
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
         elif path.startswith("/audio/"):
             dl_name = params.get("dl", [None])[0]
             self._serve_audio(path[7:], dl_name=dl_name)
@@ -4259,6 +4415,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if prompt_config:
             ds_cfg["prompt_config"] = prompt_config
             ds_cfg["datasets"][0]["custom_metadata_module"] = str(PRE_DIR / "prompt_templates.py")
+        if ds.get("default_prompt"):
+            ds_cfg["default_prompt"] = ds["default_prompt"]
         try:
             os.makedirs(save_dir, exist_ok=True)
             with open(run_dataset_config, "w") as f:
@@ -4796,11 +4954,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             return
 
         # Copy model config to run dir
-        m = re.search(r"--model-config\s+(\S+)", restart_cmd)
-        if not m:
+        orig_model_config_str = _get_cmd_arg(restart_cmd, "--model-config")
+        if not orig_model_config_str:
             self._json_response({"error": "cannot parse --model-config from restart_cmd"}, status=500)
             return
-        orig_model_config = Path(m.group(1))
+        orig_model_config = Path(orig_model_config_str)
         run_dir = orig_model_config.parent
         # Strip existing _resume suffix so successive resumes don't nest names
         base_stem = re.sub(r"_resume$", "", orig_model_config.stem)
@@ -4862,9 +5020,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         new_random_crop = body.get("random_crop")
         resume_ds_path = None
         if new_crop_len is not None or new_random_crop is not None:
-            ds_match = re.search(r"--dataset-config\s+(\S+)", restart_cmd)
-            if ds_match:
-                orig_ds_path = Path(ds_match.group(1).strip("'\""))
+            orig_ds_path_str = _get_cmd_arg(restart_cmd, "--dataset-config")
+            if orig_ds_path_str:
+                orig_ds_path = Path(orig_ds_path_str)
                 if orig_ds_path.exists():
                     try:
                         with open(orig_ds_path) as f:
@@ -4882,9 +5040,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         resume_ds_path = None
 
         # Build new restart_cmd — max_steps is absolute since StepOffsetCallback offsets global_step
-        new_cmd = re.sub(r"--model-config\s+\S+", f"--model-config {_bash_quote(_app_path(resume_config_path))}", restart_cmd)
+        new_cmd = re.sub(rf"--model-config\s+{_CMD_VALUE}", f"--model-config {_bash_quote(_app_path(resume_config_path))}", restart_cmd)
         if resume_ds_path:
-            new_cmd = re.sub(r"--dataset-config\s+\S+", f"--dataset-config {_bash_quote(_app_path(resume_ds_path))}", new_cmd)
+            new_cmd = re.sub(rf"--dataset-config\s+{_CMD_VALUE}", f"--dataset-config {_bash_quote(_app_path(resume_ds_path))}", new_cmd)
         new_cmd = re.sub(r"--max-steps\s+\d+", f"--max-steps {new_max_steps}", new_cmd)
         if batch_size:
             new_cmd = re.sub(r"--batch-size\s+\d+", f"--batch-size {int(batch_size)}", new_cmd)
@@ -5056,6 +5214,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     print(f"[delete] Deleted audio dir: {audio_dir}")
                 except Exception as e:
                     print(f"[delete] Failed to delete {audio_dir}: {e}")
+
+            # Per-run config files written at creation time
+            for cfg_name in (f"{run_id}_model.json", f"{run_id}_dataset.json"):
+                cfg_path = RUNS_DIR / cfg_name
+                if cfg_path.exists():
+                    try:
+                        cfg_path.unlink()
+                        print(f"[delete] Deleted config: {cfg_path}")
+                    except Exception as e:
+                        print(f"[delete] Failed to delete {cfg_path}: {e}")
 
             # Resume config files (live in RUNS_DIR alongside the per-run configs)
             config_dir = RUNS_DIR
@@ -5386,8 +5554,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
                 # ── gradio log for a specific instance (Log Explorer modal) ─
                 # Gradio logs use \r for tqdm-style in-place updates and need
-                # collapsing across the whole file, so we re-read in full
-                # when the file size changes (gradio logs stay small).
+                # collapsing across the content we read. Logs are unbounded
+                # (the tailer appends forever), so we tail the last ~512 KB
+                # when the file size changes — we only render the last 1000
+                # lines anyway.
                 if gradio_id:
                     try:
                         inst = next(
@@ -5399,8 +5569,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         if lp and os.path.exists(lp):
                             file_size = os.path.getsize(lp)
                             if file_size != gradio_log_size:
+                                tail_max = 512 * 1024
                                 with open(lp, "rb") as f:
-                                    raw = f.read()
+                                    if file_size > tail_max:
+                                        f.seek(file_size - tail_max)
+                                        raw = f.read()
+                                        nl = raw.find(b"\n")
+                                        if nl >= 0:
+                                            raw = raw[nl + 1:]
+                                    else:
+                                        raw = f.read()
                                 lines = []
                                 for chunk in raw.split(b"\n"):
                                     if b"\r" in chunk:
@@ -5458,7 +5636,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 pass
 
     def _serve_audio(self, rel_path, dl_name=None):
-        fpath = AUDIO_DIR / rel_path
+        fpath = (AUDIO_DIR / rel_path).resolve()
+        if not str(fpath).startswith(str(AUDIO_DIR.resolve())):
+            self.send_error(403)
+            return
         if not fpath.exists() or not fpath.is_file():
             self.send_error(404)
             return
@@ -5554,7 +5735,21 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.send_error(400, "Missing path parameter")
             return
         fpath = Path(ckpt_path)
-        if not fpath.exists() or not fpath.is_file() or fpath.suffix not in (".ckpt", ".safetensors"):
+        if fpath.suffix not in (".ckpt", ".safetensors"):
+            self.send_error(404)
+            return
+        fpath = fpath.resolve()
+        # Restrict to the per-run checkpoint dirs (plus RUNS_DIR itself for
+        # legacy layouts) so an arbitrary path can't reach outside the state.
+        allowed = [str(RUNS_DIR.resolve())]
+        for r in registry.list_runs():
+            cd = r.get("checkpoints_dir")
+            if cd:
+                allowed.append(str(Path(cd).resolve()))
+        if not any(str(fpath).startswith(root) for root in allowed):
+            self.send_error(403)
+            return
+        if not fpath.exists() or not fpath.is_file():
             self.send_error(404)
             return
         size = fpath.stat().st_size
@@ -5574,6 +5769,18 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         return registry.get_active_run_id()
 
     def _get_gpu_info(self):
+        """GPU info with a shared TTL cache (see _compute_gpu_info)."""
+        now = time.time()
+        with _gpu_info_cache_lock:
+            cached = _gpu_info_cache["data"]
+            if cached is not None and now - _gpu_info_cache["ts"] < GPU_INFO_TTL:
+                return cached
+            data = self._compute_gpu_info()
+            _gpu_info_cache["data"] = data
+            _gpu_info_cache["ts"] = now
+            return data
+
+    def _compute_gpu_info(self):
         """Query nvidia-smi and annotate GPUs with training/gradio labels.
         Generous timeout because the first nvidia-smi call on a fresh Colab
         VM can take 5–10 s while the driver initializes."""
@@ -5600,30 +5807,22 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         except Exception:
             return {"gpus": [], "gradio_estimate": _gradio_vram, "cuda_to_nvidia": {}}
 
-        # Map nvidia-smi indices to CUDA device indices by matching GPU names.
-        # On Windows, nvidia-smi and torch.cuda enumerate GPUs in different
-        # orders.  We match by name and rewrite g["gpu"] to the CUDA index.
-        cuda_to_nvidia = {}
-        try:
-            import torch
-            for cuda_idx in range(torch.cuda.device_count()):
-                props = torch.cuda.get_device_properties(cuda_idx)
-                cuda_name = props.name
-                for g in gpus:
-                    if cuda_name.lower() in g["name"].lower() or g["name"].lower() in cuda_name.lower():
-                        nvidia_idx = g["gpu"]
-                        cuda_to_nvidia[cuda_idx] = nvidia_idx
-                        g["gpu"] = cuda_idx
-                        g["nvidia_index"] = nvidia_idx
-                        break
-        except Exception:
-            pass
-        global _cuda_to_nvidia
-        _cuda_to_nvidia = cuda_to_nvidia
-
         caps = _query_gpu_compute_caps()
         for g in gpus:
             g["compute_cap"] = caps.get(g["gpu"])
+
+        # Map nvidia-smi indices to CUDA device indices. On Windows the two
+        # tools can enumerate GPUs in different orders. The CUDA-side list
+        # comes from a one-shot subprocess (see _get_cuda_gpu_names) so this
+        # process never opens a CUDA context; g["gpu"] is rewritten to the
+        # CUDA index, the original index is kept as g["nvidia_index"].
+        nvidia_order = [(g["gpu"], g["name"]) for g in gpus]
+        nvidia_to_cuda, cuda_to_nvidia = _match_gpu_orders(_get_cuda_gpu_names(), nvidia_order)
+        for g in gpus:
+            g["nvidia_index"] = g["gpu"]
+            g["gpu"] = nvidia_to_cuda.get(g["gpu"], g["gpu"])
+        global _cuda_to_nvidia
+        _cuda_to_nvidia = cuda_to_nvidia
 
         # Build lookup: gpu -> used_mb for checking occupancy
         gpu_mem = {g["gpu"]: g["used_mb"] for g in gpus}
@@ -6880,7 +7079,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     lp = Path(latent_dir)
                     if lp.is_dir():
                         try:
-                            encoded = sum(1 for _ in lp.rglob("*.npy"))
+                            encoded = _count_npy_cached(lp)
                         except Exception:
                             pass
 

@@ -11,6 +11,7 @@ import os
 import random
 
 _prompt_config = None
+_dataset_config = None
 
 _TAG_DISPLAY = {
     "title": "Title", "artist": "Artist", "album": "Album",
@@ -22,8 +23,9 @@ _ALL_TAG_KEYS = list(_TAG_DISPLAY.keys())
 
 def set_config(dataset_config):
     """Called by dataset loader with the full dataset config JSON."""
-    global _prompt_config
+    global _prompt_config, _dataset_config
     _prompt_config = dataset_config.get("prompt_config", None)
+    _dataset_config = dataset_config
 
 
 def _get(metadata, key):
@@ -120,11 +122,19 @@ def _legacy_prompt(metadata):
 
 # ── Main entry point ─────────────────────────────────────────────────
 
+def _default_prompt_fallback():
+    """Dataset-level default_prompt, if the dashboard stored one."""
+    return (_dataset_config or {}).get("default_prompt") or ""
+
+
 def get_custom_metadata(metadata, audio):
     pc = _prompt_config
 
     if pc is None:
-        return {"prompt": _legacy_prompt(metadata), "lyrics": ""}
+        prompt = _legacy_prompt(metadata)
+        if not prompt:
+            prompt = _default_prompt_fallback()
+        return {"prompt": prompt, "lyrics": ""}
 
     use_tags = pc.get("use_tags", True)
     use_paths = pc.get("use_paths", False)
@@ -161,6 +171,12 @@ def get_custom_metadata(metadata, audio):
             chosen_method, prompt = random.choice(candidates)
         else:
             chosen_method, prompt = random.choices(candidates, weights=weights, k=1)[0]
+
+    # Fallback for uncaptioned samples: the chosen method produced nothing
+    # (no tags, empty fixed text, ...) — use the dataset's default_prompt
+    # when one is set, so training doesn't see a bare empty prompt.
+    if not prompt:
+        prompt = _default_prompt_fallback()
 
     # Prepend trigger token based on trigger_pct
     if trigger and trigger_pct > 0 and random.random() * 100 < trigger_pct:

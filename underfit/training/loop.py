@@ -235,23 +235,28 @@ def _explain_model_load_error(exc, model_config):
 
 
 def _compute_grad_and_lora_norms(lora_params):
-    """Post-clip grad norm and LoRA magnitude across LoRA params."""
-    grad_sq = 0.0
-    grad_count = 0
-    lora_sq = 0.0
-    lora_count = 0
+    """Post-clip grad norm and LoRA magnitude across LoRA params.
+
+    Squared sums accumulate on-device; exactly one .item() sync per metric
+    instead of one per LoRA parameter per metric (a GPU->CPU stall on every
+    step, hundreds of times).
+    """
+    grad_sq = None
+    lora_sq = None
+    any_grad = False
     for p in lora_params:
+        w = p.detach().float()
+        if lora_sq is None:
+            lora_sq = w.new_zeros(())
+            grad_sq = w.new_zeros(())
+        lora_sq = lora_sq + w.pow(2).sum()
         if p.grad is not None:
-            gn = p.grad.data.float().norm(2).item()
-            if gn == gn:
-                grad_sq += gn ** 2
-                grad_count += 1
-        m = p.data.float().norm(2).item()
-        lora_sq += m ** 2
-        lora_count += 1
-    grad_norm = math.sqrt(grad_sq) if grad_count > 0 else None
-    lora_mag = math.sqrt(lora_sq) if lora_count > 0 else None
-    return grad_norm, lora_mag
+            any_grad = True
+            grad_sq = grad_sq + p.grad.detach().float().pow(2).sum()
+    if lora_sq is None:
+        return None, None
+    grad_norm = math.sqrt(grad_sq.item()) if any_grad else None
+    return grad_norm, math.sqrt(lora_sq.item())
 
 
 def run_training(args, backend):
@@ -419,7 +424,15 @@ def run_training(args, backend):
     run_label = re.sub(r"-\d{14}$", "", args.name) if args.name else None
 
     # --- Loss-by-timestep log ---
-    lbt_log = _LossByTimestepLog(os.path.join(os.getcwd(), "loss_by_timestep.bin"))
+    # The dashboard reads this from <save_dir>/<name>/demos/ (the demo source
+    # dir it launches the subprocess in). Fall back to cwd for manual CLI runs
+    # without --save-dir.
+    if args.save_dir and args.name:
+        lbt_dir = os.path.join(args.save_dir, args.name, "demos")
+    else:
+        lbt_dir = os.getcwd()
+    os.makedirs(lbt_dir, exist_ok=True)
+    lbt_log = _LossByTimestepLog(os.path.join(lbt_dir, "loss_by_timestep.bin"))
 
     # --- Manual save request (SIGUSR1 on Unix, file flag on Windows) ---
     manual_save_requested = [False]
@@ -525,6 +538,7 @@ def run_training(args, backend):
                 import traceback
                 traceback.print_exc()
 
+        nan_streak = 0
         while raw_step < max_steps:
             batches_this_epoch = 0
             pbar = tqdm(
@@ -653,6 +667,22 @@ def run_training(args, backend):
                     optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
+
+                # --- Non-finite loss guard: stop after a few consecutive bad
+                # steps so a diverging run doesn't burn epochs on garbage
+                # (NaN grads silently poison the weights).
+                if torch.isfinite(loss):
+                    nan_streak = 0
+                else:
+                    nan_streak += 1
+                    print(f"\n[NaN] non-finite loss at step {global_step} "
+                          f"({nan_streak} consecutive)", flush=True)
+                    if nan_streak >= 5:
+                        raise RuntimeError(
+                            f"Loss stayed non-finite for {nan_streak} consecutive "
+                            "steps — likely divergence (lr too high or a "
+                            "corrupt sample)."
+                        )
 
                 # --- Log metrics on the tqdm postfix (the dashboard parses this format) ---
                 lr = optimizer.param_groups[0]["lr"]
