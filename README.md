@@ -1,8 +1,7 @@
 # underfit
 
-**The power-user LoRA dashboard for making custom finetunes of [Stable Audio 3](https://huggingface.co/stabilityai/stable-audio-3-medium).**
+**Modified Adapter Training UI for [Stable Audio 3](https://huggingface.co/stabilityai/stable-audio-3-medium), based on [dada-bots repo](https://github.com/dada-bots/underfit).**
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dada-bots/underfit/blob/main/underfit-colab.ipynb)  ![python](https://img.shields.io/badge/python-3.10-blue)  ![license](https://img.shields.io/badge/license-MIT-green)
 
 ---
 
@@ -12,15 +11,15 @@
 
 ## Quickstart — local GPU box
 
-Linux box with an NVIDIA GPU, `git`, and `curl`. Everything else gets fetched automatically.
+Adapted for Windows, other OS not tested.
 
 ```bash
-git clone https://github.com/dada-bots/underfit && cd underfit
-./install.sh                            # ~5 min: installs uv, syncs deps, clones SA3, downloads model packs
-./run.sh                                # serves the dashboard on http://localhost:8787
+git clone https://github.com/dopf-26/underfit && cd underfit
+./install.ps1                            # ~5 min: installs uv, syncs deps, clones SA3, downloads model packs
+./run.ps1                                # serves the dashboard on http://localhost:8787
 ```
 
-Open the URL in a browser, click **+ New Dataset** to star
+Open the URL in a browser, click **+ New Dataset** to start
 
 > **First time only** — open https://huggingface.co/stabilityai/stable-audio-3-medium and click *Agree and access repository*. The three SA3 ARC repos share one license; one click unlocks all three. Approval is instant. Without it the install fails with `401 Unauthorized` on the ARC checkpoint downloads. (The base checkpoints aren't gated.)
 
@@ -29,33 +28,13 @@ Open the URL in a browser, click **+ New Dataset** to star
 
 ---
 
+## Fork Features
 
-## Quickstart — Google Colab
-
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dada-bots/underfit/blob/main/underfit-colab.ipynb) 
-
-Jankier than running locally, but still works. Read more here: https://github.com/dada-bots/underfit#running-on-colab
-
----
-
-## Requirements
-
-|                | |
-|---             |---|
-| **OS**         | Linux. (Windows untested.) |
-| **GPU**        | NVIDIA. ≥16 GB VRAM ideal. 8 GB still works with minimal settings: fp16 base model + low rank + small latent crop + batch 1 |
-| **Python**     | 3.10 (auto-fetched by `uv`). |
-| **Disk**       | Plan for ~17 GB per SA3-medium pack, ~7 GB per small pack. All three = ~31 GB of checkpoints. Datasets add a few hundred MB each. |
-| **HF account** | Free. Needed to accept the [SA3 license](https://huggingface.co/stabilityai/stable-audio-3-medium) once. |
-
-| GPU tier   | Fit | Notes |
-|---         |---|---|
-| H100 (80GB)| ✅ | Great. Very fast. Holds many finetunes per GPU |
-| A100 / L4  / G4 / 4090 | ✅ | Comfortable. |
-| T4 (16GB)  | ⚠️ | Slow, requires patience, but works. |
-| Mac | ❌ | In theory we could support training on MPS, but it would be very slow. |
-| CPU only   | ❌ | Won't train. |
-
+- Windows Support
+- Torch Compile for faster training (takes about 3-5 minutes to compile per run)
+- Gradient Checkpointing toggle for faster training at the cost of more VRAM usage
+- Queue System (set up multiple runs that start automatically after the last one finished)
+- Timestep Shift (to focus training on structure or fine detail)
 ---
 
 
@@ -153,9 +132,9 @@ In the dashboard click **+ Finetune**.
 | **Name** | `my-first-lora` (alphanumeric + hyphens) | Run ID + `.safetensors` filename |
 | **Model** | `sa3-medium` | Base model to finetune against |
 | **Dataset** | the one you created in Step 3 | Pre-encoded latents |
-| **LoRA type** | **`DoRA`** | Recommended. |
+| **LoRA type** | **`LoRA`** | Recommended for ComfyUI compatibility. |
 | **LoRA rank** | `16` | Capacity. Higher = more parameters + sometimes higher quality + more overfitting risk. Smaller = sometimes learns style better. |
-| **Steps** | `20000` | A reasonable LoRA lands around 10k — that's where it *creatively underfits*: still varied on new prompts, not yet memorising. Past 20k it may overfit. |
+| **Steps** | `5000` | My LoRAs are usually done at around 4500 steps, depending on the dataset. An epoch count of 125-150 is the target. |
 | **Batch size** | `1` on T4, up to `8` on H100 | Bigger = uses more VRAM. |
 | **Latent length** | model default, or shorter | You can train shorter than the model's max. Lower = faster, less memorization, often better style learning, useful for audio2audio. |
 | **Learning rate** | leave default | Higher may learn faster but also collapse training. May need higher for XS variants. Lower may help learn more subtle details. |
@@ -256,41 +235,6 @@ Pass multiple `.safetensors` to blend LoRAs. Strengths interact non-linearly —
 
 - **Continue training from an uploaded LoRA.** In *New Finetune*, the *Start from a previous LoRA* upload picks up your `.safetensors` and keeps going. There's an art to mixing datasets this way — e.g. I trained a music-style DoRA (Dadabots, baroquecore) for 10k steps at 47s, then continued on a production-quality DoRA (Encanti, bass music) at 12s for 300 steps. The result was a LoRA that fuses both styles in a way neither alone produce.
 - **Any SA3 inference setup can theoretically load it if they support it.** Plugins, ComfyUI nodes, custom Python wrappers.
-
----
-
-## Running on Colab
-
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dada-bots/underfit/blob/main/underfit-colab.ipynb)
-
-Same underfit, same dashboard, just hosted on Colab's GPU instead of yours. The notebook walks through everything end-to-end. Definitely jankier than running it locally yourself. 
-
-### Why Colab
-
-Zero install on your machine. Free GPU access for experimenting. Free tier is slow (T4). Pro tier ($9.99) gets you a H100 which is fast.
-
-### Important Colab-specific quirks
-
-**Pre-emption.** At some point your session will time-out and get canceled. Ephemeral storage will be deleted. However, Google Drive integration means your runs persist across sessions. On the next reboot, the backup logs, checkpoints, training runs will be available in the dashboard.
-
-**Use ngrok in Step 4.** Colab's built-in port-proxy buffers HTTP responses aggressively, which makes the dashboard feel laggy and occasionally freeze. Audio playback is the worst offender — the proxy holds the entire audio file before forwarding to your browser instead of streaming it, blocking every other request until done. *Training itself is unaffected* — it runs as a detached subprocess on the GPU and survives dashboard freezes or closed tabs. Free signup at [ngrok.com](https://ngrok.com) and paste your auth token into the `NGROK_AUTHTOKEN` field in Step 4. If anything ever freezes, re-run Step 4 to restart the server. Colab is nice, but using a normal Linux box is the most reliable setup. 
-
-
-### Colab troubleshooting
-
-- **"NO GPU DETECTED" in Step 1** → Runtime → Change runtime type → Hardware accelerator → pick a GPU → Save. Re-run Step 1.
-- **`401 Unauthorized` / `GatedRepoError` in Step 3** → Accept the SA3 license at https://huggingface.co/stabilityai/stable-audio-3-medium. One click unlocks all three ARC repos. Re-run Step 3.
-- **Dashboard frozen** → re-run Step 4. Training runs are unaffected.
-
----
-
-## Troubleshooting (general)
-
-- **`GatedRepoError: 403 Client Error`** on ARC downloads → You haven't accepted the [SA3 license](https://huggingface.co/stabilityai/stable-audio-3-medium). One click, instant approval, all three ARC repos unlock.
-- **`ModuleNotFoundError: No module named 'stable_audio_3'`** → The SA3 sibling clone got moved or never installed. Re-run `./install.sh` — it'll re-clone and `uv pip install -e` it.
-- **Dashboard says port already in use** → another instance is running. Find with `ps aux | grep server.py`, kill it, then `./run.sh` again.
-- **Demos sound identical to the input** → overfitting too fast. Go back and and find an earlier checkpoint that is more interesting. Re-run with a lower sequence length and random crop. Or lower the rank, or learning rate.
-- **Demos sound nothing like the input even at 20k+** → the dataset may be too varied, the rank too low, or the LR too low.
 
 ---
 
