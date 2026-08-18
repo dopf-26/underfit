@@ -53,11 +53,14 @@ def _get_demo_latent_length(model, sample_size, latent_crop_length=None):
 
 
 def _save_demo_file(audio_int16, demo_index, step, sample_rate, meta=None):
-    """Save the demo .wav + JSON sidecar atomically: each is written to a
-    .part temp name then os.replace()d onto the final name, so the dashboard
-    never reads a half-written file. Already-present final outputs are skipped,
-    so a crash mid-write (partial .wav or missing .json) is redone on the next
-    call instead of leaving a stale partial file behind."""
+    """Save the demo .wav + JSON sidecar atomically: each is written to a temp
+    name in the same directory, then os.replace()d onto the final name, so the
+    dashboard never reads a half-written file. The audio temp ends in ".wav"
+    (the format is inferred from the extension; the torchcodec path ignores the
+    `format` arg) with a leading dot so a leftover temp doesn't match the
+    dashboard's demo_* globs. The JSON temp ends in ".part". Already-present
+    final outputs are skipped, so a crash mid-write is redone on the next call
+    instead of leaving a stale partial file behind."""
     import torchaudio  # lazy: see module-level note
     import soundfile as sf
     import numpy as np  # noqa: F401  (used by torchaudio path)
@@ -79,8 +82,12 @@ def _save_demo_file(audio_int16, demo_index, step, sample_rate, meta=None):
 
     # Write the audio to a temp name, then atomically rename onto the final
     # name, so a crash mid-write never leaves a partial file at the final path.
+    # The temp MUST end in ".wav" (both torchaudio.save and the soundfile
+    # fallback infer the format from the extension, and the torchcodec path
+    # ignores the `format` arg); the leading dot keeps a leftover temp from
+    # matching the dashboard's demo_* globbing.
     if not os.path.exists(final_wav):
-        tmp_wav = final_wav + ".part"
+        tmp_wav = "." + final_wav
         try:
             torchaudio.save(tmp_wav, audio_int16, sample_rate)
             os.replace(tmp_wav, final_wav)
