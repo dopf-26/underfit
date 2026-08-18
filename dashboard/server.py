@@ -26,8 +26,11 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 import numpy as np
 import soundfile as sf
-import torch
 from PIL import Image
+# NOTE: torch is imported lazily inside the spectrogram helpers below
+# (_mel_filterbank/_melspectrogram/_load_audio) so that opening the dashboard
+# server does not pull in the ~GB torch dependency (or a CUDA context) when
+# only the UI is in use. All three are CPU-only ops.
 
 BASE_DIR = Path(__file__).parent.parent
 DASHBOARD_DIR = Path(__file__).parent
@@ -2352,6 +2355,22 @@ def _recover_orphaned_gradios():
     return recovered
 
 
+def _remove_save_ckpt_flag(run_id, save_dir):
+    """Remove an orphaned manual-checkpoint flag (<save_dir>/<run_id>_save_ckpt.flag).
+
+    The training loop removes the flag when it observes it (training/loop.py). If
+    the run ends first (crash/kill/completion before the loop's next checkpoint
+    step), the flag is orphaned — clean it up so a later resume doesn't see a
+    stale 'save requested' signal. No-op if the flag doesn't exist.
+    """
+    try:
+        flag = os.path.join(save_dir or str(RUNS_DIR), run_id + "_save_ckpt.flag")
+        if os.path.exists(flag):
+            os.remove(flag)
+    except Exception:
+        pass
+
+
 class TrainingMonitor:
     """Monitors training processes and restarts on crash."""
 
@@ -2388,7 +2407,11 @@ class TrainingMonitor:
                 # Iterate ALL runs with active status
                 for run in self._registry.list_runs():
                     run_status = run.get("status")
-                    if run_status not in ("training", "paused"):
+                    # Also watch loading/resuming: today these are display-derived
+                    # labels, but if a process dies during init before the status
+                    # settles to "training", the run would otherwise stay active
+                    # with no monitor action.
+                    if run_status not in ("training", "paused", "loading", "resuming"):
                         continue
                     pid = run.get("pid")
                     restart_cmd = run.get("restart_cmd")
@@ -2400,8 +2423,12 @@ class TrainingMonitor:
                     # Re-read from registry to avoid acting on stale data
                     run_id = run["id"]
                     fresh_run = self._registry.get_run(run_id)
-                    if not fresh_run or fresh_run.get("status") not in ("training", "paused"):
+                    if not fresh_run or fresh_run.get("status") not in ("training", "paused", "loading", "resuming"):
                         continue
+                    # Process is dead and the run is about to be marked terminal —
+                    # remove any orphaned manual-checkpoint flag the training loop
+                    # never got to observe (the loop removes it itself when it sees it).
+                    _remove_save_ckpt_flag(run_id, fresh_run.get("checkpoints_dir"))
                     # Paused runs that died — just mark killed, don't restart
                     if fresh_run.get("status") == "paused":
                         hint = _diagnose_quick_kill(fresh_run)
@@ -3487,6 +3514,7 @@ def _mel_frequencies(n_mels, fmax, fmin=0.0):
 
 @lru_cache(maxsize=8)
 def _mel_filterbank(n_mels, n_fft, sr, fmax):
+    import torch  # lazy: keep torch out of server import (see module note)
     pts = _mel_to_hz(np.linspace(_hz_to_mel(0.0), _hz_to_mel(fmax), n_mels + 2))
     fft_f = np.linspace(0, sr / 2, n_fft // 2 + 1)
     filt = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float32)
@@ -3502,6 +3530,7 @@ def _mel_filterbank(n_mels, n_fft, sr, fmax):
 
 
 def _melspectrogram(y_ch, sr, n_mels=30, fmax=16000, hop_length=2048, n_fft=2048):
+    import torch  # lazy: keep torch out of server import (see module note)
     y_t = torch.from_numpy(np.ascontiguousarray(y_ch)).float()
     win = torch.hann_window(n_fft)
     spec = torch.stft(y_t, n_fft=n_fft, hop_length=hop_length, window=win,
@@ -3520,6 +3549,7 @@ def _load_audio(path, target_sr=32000):
     if y.ndim == 2:
         y = y.T  # soundfile gives (n, c); we want (c, n)
     if sr != target_sr:
+        import torch  # lazy: only needed for resampling (see module note)
         y_t = torch.from_numpy(np.ascontiguousarray(y))
         if y_t.ndim == 1:
             y_t = y_t.unsqueeze(0)
@@ -4573,12 +4603,15 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 # Frontend provided everything — just extract non-fixed prompts for display
                 run_demo_prompts = [e.get("prompt", "") for e in demo_cond
                                     if not e.get("fixed_prompt")]
-            # Assign random seeds 10-100 to demos that don't already have one
+            # Assign random seeds 10-100 to demos that don't already have one.
+            # Mark backend-assigned seeds (seed_assigned) so resume can re-roll
+            # ONLY those and leave user-set fixed seeds untouched.
             import random as _rng
             demo_cond = cfg.get("training", {}).get("demo", {}).get("demo_cond", [])
             for entry in demo_cond:
                 if entry.get("seed") is None:
                     entry["seed"] = _rng.randint(10, 100)
+                    entry["seed_assigned"] = True
             # Embed source-file relpath into demo_cond so future clones can
             # rehydrate ground truth from the model config alone — no dependency
             # on runs.json. Each demo_cond entry pairs 1:1 with the frontend's
@@ -4931,7 +4964,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if ckpts_dir.exists():
                 # Prefer .safetensors over .ckpt
                 ckpts = list(ckpts_dir.rglob("*.safetensors")) + list(ckpts_dir.rglob("*.ckpt"))
-                ckpts = [c for c in ckpts if run_id in str(c)]
+                # Exact path-component match (not substring) so a run named "foo"
+                # can't cross-match "foo-v2" checkpoints. run_id is always a
+                # single directory component under save_dir.
+                ckpts = [c for c in ckpts if run_id in c.parts]
                 if ckpts:
                     ckpts.sort(key=lambda c: c.stat().st_mtime, reverse=True)
                     latest_ckpt = ckpts[0]
@@ -4987,10 +5023,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if lr_raw:
                 lr_val = float(lr_raw)
                 cfg.setdefault("training", {}).setdefault("optimizer_configs", {}).setdefault("diffusion", {}).setdefault("optimizer", {}).setdefault("config", {})["lr"] = lr_val
-            # Assign fresh random seeds 10-100 to each demo on resume
+            # Re-roll ONLY backend-assigned random demo seeds on resume; preserve
+            # user-set fixed seeds (no seed_assigned marker) so they stay stable
+            # across resumes. Defensive: re-assign any entry that has no seed at all.
             import random as _rng
             for entry in cfg.get("training", {}).get("demo", {}).get("demo_cond", []):
-                entry["seed"] = _rng.randint(10, 100)
+                if entry.get("seed") is None:
+                    entry["seed"] = _rng.randint(10, 100)
+                    entry["seed_assigned"] = True
+                elif entry.get("seed_assigned"):
+                    entry["seed"] = _rng.randint(10, 100)
             # Honor an explicit value from the frontend (true OR false) so the
             # checkbox can also switch compile OFF — otherwise the flag sticks
             # at whatever the previous launch stored. Absent key (old client)
@@ -5175,6 +5217,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if inst.get("run_id") == run_id and inst["status"] in ("starting", "ready"):
                 gradio_manager.stop(inst["id"])
                 print(f"[delete] Stopped Gradio instance {inst['id']} for run {run_id}")
+
+        # Remove any orphaned manual-checkpoint flag (the training loop is gone).
+        _remove_save_ckpt_flag(run_id, run.get("checkpoints_dir"))
 
         # Remove from registry
         registry.remove_run(run_id)
@@ -6054,17 +6099,40 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._json_response({"error": "not a training process"}, status=400)
             return
 
-        # Parse args from cmdline
-        name_m = re.search(r"--name\s+(\S+)", cmdline)
-        save_dir_m = re.search(r"--save-dir\s+(\S+)", cmdline)
-        model_config_m = re.search(r"--model-config\s+(\S+)", cmdline)
-        max_steps_m = re.search(r"--max-steps\s+(\d+)", cmdline)
-        batch_m = re.search(r"--batch-size\s+(\d+)", cmdline)
-        ckpt_every_m = re.search(r"--checkpoint-every\s+(\d+)", cmdline)
+        # Read the raw argv token list (cross-platform via psutil) BEFORE
+        # parsing flags: the space-joined cmdline mis-parses quoted paths that
+        # contain spaces, while argv tokens are already split correctly. This
+        # same list is reused below for restart_cmd reconstruction.
+        raw_argv = None
+        try:
+            import psutil
+            raw_argv = list(psutil.Process(pid).cmdline())
+        except Exception:
+            raw_argv = None
 
-        run_name = name_m.group(1) if name_m else f"adopted-{pid}"
-        save_dir = save_dir_m.group(1) if save_dir_m else str(RUNS_DIR)
-        max_steps = int(max_steps_m.group(1)) if max_steps_m else 20000
+        def _argv_value(flag):
+            """Return the token immediately following `flag` in raw_argv, else None."""
+            if not raw_argv:
+                return None
+            for i, tok in enumerate(raw_argv):
+                if tok == flag and i + 1 < len(raw_argv):
+                    return raw_argv[i + 1]
+            return None
+
+        if raw_argv:
+            # Prefer the exact argv tokens (paths with spaces survive).
+            run_name = _argv_value("--name") or f"adopted-{pid}"
+            save_dir = _argv_value("--save-dir") or str(RUNS_DIR)
+            _ms = _argv_value("--max-steps")
+            max_steps = int(_ms) if _ms else 20000
+        else:
+            # Fallback: best-effort regex from the space-joined cmdline (legacy).
+            name_m = re.search(r"--name\s+(\S+)", cmdline)
+            save_dir_m = re.search(r"--save-dir\s+(\S+)", cmdline)
+            max_steps_m = re.search(r"--max-steps\s+(\d+)", cmdline)
+            run_name = name_m.group(1) if name_m else f"adopted-{pid}"
+            save_dir = save_dir_m.group(1) if save_dir_m else str(RUNS_DIR)
+            max_steps = int(max_steps_m.group(1)) if max_steps_m else 20000
 
         # Check not already registered
         if registry.get_run(run_name):
@@ -6098,13 +6166,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         # python interpreter (python / python3 / python.exe / any path to one)
         # is dropped; the command is re-anchored on "python" (VENV_PYTHON is
         # re-prepended at restart via _build_launch_command).
-        raw_argv = None
-        try:
-            import psutil
-            raw_argv = list(psutil.Process(pid).cmdline())
-        except Exception:
-            raw_argv = None
-
+        # raw_argv was fetched above (used for flag parsing); reuse it here.
         home_bash = _bash_path(os.path.expanduser("~"))
         if raw_argv:
             if os.path.basename(raw_argv[0]).lower().split(".")[0] in ("python", "python3"):
@@ -7028,7 +7090,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             "input_dir": str(input_path),
             "latent_dir": str(latent_dir),
             "model": model,
-            "latent_dim": 64,  # will be updated from details.json on completion
+            # Seed latent_dim from the selected model's registry entry (e.g. 256 for
+            # SA3) rather than a fixed 64, so import-flow encoder matching works even
+            # before encoding finishes. details.json overrides this on completion.
+            "latent_dim": MODELS_UI_PAYLOAD.get(model, {}).get("latent_dim") or 64,
             "num_files": num_files,
             "sample_rate": 44100,
             "status": "encoding",
@@ -7466,6 +7531,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             }
             if run.get("restart_count"):
                 latest["restart_count"] = run["restart_count"]
+                latest["max_restart_attempts"] = TrainingMonitor.MAX_RESTART_ATTEMPTS
             if run.get("error"):
                 latest["error"] = run["error"]
             # Retroactive OOM detection for killed runs without stored error
@@ -7505,6 +7571,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     "step_offset": step_offset}
             if run.get("restart_count"):
                 resp["restart_count"] = run["restart_count"]
+                resp["max_restart_attempts"] = TrainingMonitor.MAX_RESTART_ATTEMPTS
             if run.get("error"):
                 resp["error"] = run["error"]
             # Retroactive OOM detection

@@ -453,10 +453,16 @@ def run_training(args, backend):
     # --- torch.compile (optional) ---
     if training_config.get("torch_compile"):
         from torch._dynamo import config as dynamo_config
+        # suppress_errors=True: if compiling any op fails mid-run, that step
+        # silently falls back to eager rather than crashing the whole run. The
+        # cost is a per-step speed drop with NO per-step log line — accepted so a
+        # single compile hiccup can't kill a long training run.
         dynamo_config.suppress_errors = True
         try:
             model = torch.compile(model)
-            print("[startup] torch.compile enabled — first few steps may be slow (compilation warmup)", flush=True)
+            print("[startup] torch.compile enabled — first few steps may be slow (compilation warmup). "
+                  "Note: a per-op compile failure mid-run silently falls back to eager for that "
+                  "step (suppress_errors) with no per-step log line.", flush=True)
         except Exception as e:
             print(f"[startup] torch.compile failed ({e}); falling back to eager mode", flush=True)
 

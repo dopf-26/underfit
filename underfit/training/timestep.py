@@ -21,9 +21,14 @@ def sample_timesteps_logsnr_uniform(batch_size, min_logsnr=-6.0, max_logsnr=5.0)
     return torch.sigmoid(-logsnr).clamp(1e-4, 1 - 1e-4)
 
 
-def truncated_logistic_normal_rescaled(shape, left_trunc=0.075, right_trunc=1.0):
-    """Truncated logistic-normal, rescaled to [0, 1)."""
-    logits = torch.randn(shape)
+def truncated_logistic_normal_rescaled(shape, left_trunc=0.075, right_trunc=1.0, device=None):
+    """Truncated logistic-normal, rescaled to [0, 1).
+
+    `device` (optional) samples directly on the target device, avoiding a
+    CPU->GPU transfer of the whole batch. Defaults to CPU (original behavior);
+    the truncation bounds stay CPU scalars (they broadcast onto the batch).
+    """
+    logits = torch.randn(shape, device=device)
     normal_dist = dist.Normal(0, 1)
     cdf_values = normal_dist.cdf(logits)
     lower_bound = normal_dist.cdf(torch.logit(torch.tensor(left_trunc)))
@@ -56,24 +61,25 @@ def sample_t_tln_shifted(batch_size, device, ratio):
     toggle off) or 0.5 reproduces the original `trunc_logit_normal` sampler
     exactly; the bell width is unchanged - only the mean moves.
     """
+    # Sample directly on the target device (no CPU round-trip of the batch).
     if ratio is None:
-        return (1 - truncated_logistic_normal_rescaled(batch_size)).to(device)
+        return 1 - truncated_logistic_normal_rescaled(batch_size, device=device)
     ratio = float(ratio)
     if abs(ratio - 0.5) < 1e-9:
-        return (1 - truncated_logistic_normal_rescaled(batch_size)).to(device)
+        return 1 - truncated_logistic_normal_rescaled(batch_size, device=device)
     target_center = min(max(ratio + (_TLN_CENTER - 0.5), 0.05), 0.95)
     delta = _tln_z_of_center(target_center) - _tln_z_of_center(_TLN_CENTER)
     # z ~ N(delta, 1) | z > logit(left_trunc): the original sampler's one-sided
     # truncation, with only the mean moved by `delta`.
     normal_dist = dist.Normal(0, 1)
-    logits = torch.randn(batch_size)
+    logits = torch.randn(batch_size, device=device)
     cdf_values = normal_dist.cdf(logits)
     a = math.log(_TLN_LEFT_TRUNC / (1.0 - _TLN_LEFT_TRUNC))
-    lower_bound = normal_dist.cdf(torch.tensor(a - delta))
+    lower_bound = normal_dist.cdf(torch.tensor(a - delta, device=device))
     truncated_cdf_values = lower_bound + (1.0 - lower_bound) * cdf_values
     z = normal_dist.icdf(truncated_cdf_values) + delta
     truncated_samples = torch.sigmoid(z)
-    return (1 - (truncated_samples - _TLN_LEFT_TRUNC) / (1.0 - _TLN_LEFT_TRUNC)).to(device)
+    return 1 - (truncated_samples - _TLN_LEFT_TRUNC) / (1.0 - _TLN_LEFT_TRUNC)
 
 
 def sample_t(timestep_sampler, batch_size, device, options=None):

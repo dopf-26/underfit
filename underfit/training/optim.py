@@ -37,19 +37,23 @@ class InverseLR(torch.optim.lr_scheduler._LRScheduler):
 
 def create_optimizer_from_config(optimizer_config, parameters):
     optimizer_type = optimizer_config["type"]
+    # .get(...): a config with no explicit "config" block is valid (defaults only)
+    # and shouldn't KeyError — an empty dict means "use the factory's defaults".
+    optimizer_kwargs = optimizer_config.get("config", {})
     if optimizer_type == "FusedAdam":
         from deepspeed.ops.adam import FusedAdam
-        return FusedAdam(parameters, **optimizer_config["config"])
+        return FusedAdam(parameters, **optimizer_kwargs)
     if optimizer_type == "AdamW8bit":
         from bitsandbytes.optim import AdamW8bit
-        return AdamW8bit(parameters, **optimizer_config["config"])
+        return AdamW8bit(parameters, **optimizer_kwargs)
     optimizer_fn = getattr(torch.optim, optimizer_type)
-    return optimizer_fn(parameters, **optimizer_config["config"])
+    return optimizer_fn(parameters, **optimizer_kwargs)
 
 
 def create_scheduler_from_config(scheduler_config, optimizer):
+    scheduler_kwargs = scheduler_config.get("config", {})
     if scheduler_config["type"] == "InverseLR":
         scheduler_fn = InverseLR
     else:
         scheduler_fn = getattr(torch.optim.lr_scheduler, scheduler_config["type"])
-    return scheduler_fn(optimizer, **scheduler_config["config"])
+    return scheduler_fn(optimizer, **scheduler_kwargs)

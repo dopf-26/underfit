@@ -52,7 +52,9 @@ uv sync --inexact
 
 # -- 3. flash-attention prebuilt wheel --------------------------------------
 $FlashAttnUrl = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.6/flash_attn-2.8.3+cu130torch2.11-cp313-cp313-win_amd64.whl"
-$FlashAttnWhl = Join-Path $UnderfitDir "flash_attn-2.8.3+cu130torch2.11-cp313-cp313-win_amd64.whl"
+# Download the ~40MB wheel to TEMP (not the repo root) and remove it right
+# after installing, so it doesn't sit around in the working directory.
+$FlashAttnWhl = Join-Path $env:TEMP "flash_attn-2.8.3+cu130torch2.11-cp313-cp313-win_amd64.whl"
 
 if (-not (Test-Path $FlashAttnWhl)) {
     Say "downloading flash-attention wheel ..."
@@ -60,6 +62,7 @@ if (-not (Test-Path $FlashAttnWhl)) {
 }
 Say "installing flash-attention ..."
 uv pip install --no-deps $FlashAttnWhl
+Remove-Item $FlashAttnWhl -Force -ErrorAction SilentlyContinue
 
 # -- 4. wizard --------------------------------------------------------------
 if ($NoSetup) {

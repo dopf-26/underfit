@@ -4284,7 +4284,10 @@ function _renderDemos(newDemoData, refreshRunId) {
       if (_pendingStepFromUrl != null && demoData.steps.some(s => s.step === _pendingStepFromUrl)) {
         activeView = _pendingStepFromUrl;
       } else if (demoData.steps.length > 0) {
-        activeView = demoData.steps[demoData.steps.length - 1].step;
+        // Use the sorted steps (not the raw array's last element, which is not
+        // guaranteed to be the highest step) so we auto-select the true latest.
+        const sorted = getSortedSteps();
+        activeView = sorted[sorted.length - 1].step;
       } else {
         activeView = 'gt';
       }
@@ -4298,7 +4301,13 @@ function _renderDemos(newDemoData, refreshRunId) {
 
     // If new step appeared, auto-advance if user was on the previous latest step
     if (newStepCount > oldStepCount) {
-      const shouldAdvance = activeView === oldLatestStep || activeView === null;
+      // Advance when the user is following the latest step, was on no explicit
+      // step (null), or was sitting on the GT view with no prior steps (i.e.
+      // waiting for the first demo to appear — GT was only the placeholder
+      // because nothing existed yet). A user on GT who ALREADY has steps is
+      // deliberately comparing against ground truth, so don't pull them away.
+      const gtFirstStep = activeView === 'gt' && oldStepCount === 0;
+      const shouldAdvance = activeView === oldLatestStep || activeView === null || gtFirstStep;
       if (shouldAdvance && isAudioPlaying()) {
         // Defer advance until current audio finishes
         const sorted = getSortedSteps();
@@ -4389,7 +4398,7 @@ function renderControlButtons(st, status) {
   const activeStates = ['training', 'loading', 'resuming', 'nan', 'demos'];
   const gpuTag = activeStates.includes(st) && run && run.gpu != null ? `<span style="color:var(--text2);margin:0 10px">GPU ${run.gpu}</span>` : '';
   const isActive = activeStates.includes(st);
-  const restartTag = !isActive && status && status.restart_count ? `<span style="color:var(--orange);margin:0 6px;font-size:0.85em">restart ${status.restart_count}/3</span>` : '';
+  const restartTag = !isActive && status && status.restart_count ? `<span style="color:var(--orange);margin:0 6px;font-size:0.85em">restart ${status.restart_count}/${status.max_restart_attempts || 3}</span>` : '';
   const errorTag = !isActive && status && status.error ? `<span style="color:var(--red);margin:0 6px;font-size:0.85em">${status.error}</span>` : '';
   // kill_hint surfaces from the server when a run died fast with empty log
   // (likely OOM) or with a shell-level error captured in <log>.bash.err.

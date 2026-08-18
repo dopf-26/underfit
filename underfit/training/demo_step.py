@@ -53,28 +53,47 @@ def _get_demo_latent_length(model, sample_size, latent_crop_length=None):
 
 
 def _save_demo_file(audio_int16, demo_index, step, sample_rate, meta=None):
-    """Save mp3 + JSON sidecar atomically (temp + rename) so the dashboard
-    never copies a half-written file."""
+    """Save the demo .wav + JSON sidecar atomically: each is written to a
+    .part temp name then os.replace()d onto the final name, so the dashboard
+    never reads a half-written file. Already-present final outputs are skipped,
+    so a crash mid-write (partial .wav or missing .json) is redone on the next
+    call instead of leaving a stale partial file behind."""
     import torchaudio  # lazy: see module-level note
     import soundfile as sf
-    import numpy as np
-    
+    import numpy as np  # noqa: F401  (used by torchaudio path)
+
     def _save_audio_soundfile(uri, src, sr, **kwargs):
         data = src.cpu().numpy().T
         sf.write(str(uri), data, sr, **kwargs)
-    
+
     try:
         import torchcodec  # noqa: F401
     except ImportError:
         torchaudio.save = _save_audio_soundfile
-    
+
     final_wav = f"demo_{demo_index}_{step:08d}.wav"
-    if os.path.exists(final_wav):
+    final_json = f"demo_{demo_index}_{step:08d}.json"
+    # Nothing to do if every expected final output already exists.
+    if os.path.exists(final_wav) and (meta is None or os.path.exists(final_json)):
         return
-    torchaudio.save(final_wav, audio_int16, sample_rate)
-    if meta is not None:
-        with open(f"demo_{demo_index}_{step:08d}.json", "w") as f:
+
+    # Write the audio to a temp name, then atomically rename onto the final
+    # name, so a crash mid-write never leaves a partial file at the final path.
+    if not os.path.exists(final_wav):
+        tmp_wav = final_wav + ".part"
+        try:
+            torchaudio.save(tmp_wav, audio_int16, sample_rate)
+            os.replace(tmp_wav, final_wav)
+        except Exception:
+            if os.path.exists(tmp_wav):
+                os.remove(tmp_wav)
+            raise
+
+    if meta is not None and not os.path.exists(final_json):
+        tmp_json = final_json + ".part"
+        with open(tmp_json, "w") as f:
             json.dump(meta, f)
+        os.replace(tmp_json, final_json)
 
 
 def _build_inpaint_zeros(model, demo_samples, device, dtype):

@@ -19,10 +19,10 @@ keywords = ["audio", "diffusion", "lora", "stable-audio", "fine-tuning"]
 # Dependency manifest for `uv` (https://docs.astral.sh/uv/). This is NOT a
 # PyPI package — underfit runs directly from the git clone:
 #     git clone https://github.com/dada-bots/underfit && cd underfit
-#     ./install.sh
+#     .\install.ps1         # Windows (equivalent: uv sync && underfit-setup)
 #
 # The diffusion backend (stable-audio-3) is intentionally NOT listed here —
-# `install.sh` runs the setup wizard which clones and `uv pip install -e`s
+# install.ps1 runs the setup wizard which clones and `uv pip install -e`s
 # the stable-audio-3 source tree as an editable package.
 #
 # Pins below target torch 2.11.0 + cu130, Python 3.13.

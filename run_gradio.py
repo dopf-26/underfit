@@ -63,7 +63,7 @@ def main(args):
     )
     interface.queue()
     interface.launch(
-        share=True,
+        share=args.share,
         auth=(args.username, args.password) if args.username is not None else None,
         js=getattr(interface, "_sao_js", None),
         theme=getattr(interface, "_sao_theme", None),
@@ -79,7 +79,11 @@ if __name__ == "__main__":
     parser.add_argument("--pretransform-ckpt-path", type=str, required=False)
     parser.add_argument("--username", type=str, required=False)
     parser.add_argument("--password", type=str, required=False)
-    parser.add_argument("--model-half", action="store_true", default=True)
+    parser.add_argument("--model-half", action=argparse.BooleanOptionalAction, default=True,
+                        help="Run the model in half precision (default: on; --no-model-half for fp32)")
+    parser.add_argument("--share", action=argparse.BooleanOptionalAction, default=True,
+                        help="Create a public gradio share URL (default: on; --no-share for local only). "
+                             "The dashboard relies on the share URL, so it passes no flag (stays on).")
     parser.add_argument("--title", type=str, required=False)
     parser.add_argument("--lora-ckpt-path", type=str, nargs="*", required=False)
     parser.add_argument("--default-prompt", type=str, default=None)
