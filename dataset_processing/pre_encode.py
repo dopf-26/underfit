@@ -482,8 +482,19 @@ def _encode_shard_inner(rank, world_size, cfg):
                     # a killed encode can't leave a truncated .npy that the
                     # skip logic would treat as done.
                     tmp_npy = npy_path.with_name(npy_path.name + ".part")
-                    np.save(str(tmp_npy), latent_np, allow_pickle=False)
-                    os.replace(tmp_npy, npy_path)
+                    # Pass a file object, not the path string: np.save would
+                    # otherwise append ".npy" to the ".part" name (the temp file
+                    # would land at "<name>.npy.part.npy"), and the rename below
+                    # would fail to find "<name>.npy.part". A file object writes
+                    # to exactly the opened path.
+                    try:
+                        with open(str(tmp_npy), "wb") as _f:
+                            np.save(_f, latent_np, allow_pickle=False)
+                        os.replace(tmp_npy, npy_path)
+                    except Exception:
+                        if os.path.exists(tmp_npy):
+                            os.remove(tmp_npy)
+                        raise
 
                     tags = extract_tags(fpath)
                     meta = {
@@ -538,8 +549,19 @@ def _encode_shard_inner(rank, world_size, cfg):
                     # a killed encode can't leave a truncated .npy that the
                     # skip logic would treat as done.
                     tmp_npy = npy_path.with_name(npy_path.name + ".part")
-                    np.save(str(tmp_npy), latent_np, allow_pickle=False)
-                    os.replace(tmp_npy, npy_path)
+                    # Pass a file object, not the path string: np.save would
+                    # otherwise append ".npy" to the ".part" name (the temp file
+                    # would land at "<name>.npy.part.npy"), and the rename below
+                    # would fail to find "<name>.npy.part". A file object writes
+                    # to exactly the opened path.
+                    try:
+                        with open(str(tmp_npy), "wb") as _f:
+                            np.save(_f, latent_np, allow_pickle=False)
+                        os.replace(tmp_npy, npy_path)
+                    except Exception:
+                        if os.path.exists(tmp_npy):
+                            os.remove(tmp_npy)
+                        raise
 
                     tags = extract_tags(fpath)
                     meta = {
